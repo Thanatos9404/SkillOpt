@@ -209,11 +209,13 @@ def consolidate(
 
     Skill and memory are evolved in sequence (skill first if both enabled).
 
-    ``budget_exhausted`` is checked before the epoch starts and before each
-    evolve target. Once it returns True, the steps that have not started are
-    skipped and listed in ``budget_skipped``. A started step always finishes,
-    so every gate decision still rests on complete evidence; the final replay
-    only re-scores documents an earlier replay already scored.
+    ``budget_exhausted`` is checked before the epoch starts, before each
+    evolve target and before the final validation replay. Once it returns
+    True, the steps that have not started are skipped and listed in
+    ``budget_skipped``. A started step always finishes, so every gate decision
+    still rests on complete evidence. When the final replay is skipped, the
+    decision uses the validation replay that already scored the final skill
+    and memory: the baseline replay, or the trial replay of the last kept edit.
     """
     from skillopt_sleep import evidence as evlog
     ev = evlog.get(backend)
@@ -415,8 +417,16 @@ def consolidate(
         base_gate_score = 0.0
     else:
         # scored on the VAL slice (the gate reference)
-        evlog.set_phase(backend, "final_val")
-        final_pairs = replay_batch(backend, val_tasks, cand_skill, cand_memory)
+        if val_tasks and _budget_spent("final validation replay"):
+            # Replaying is not free on every route: tool replay and failed calls
+            # are not served from the response cache. current_pairs already
+            # scores exactly (cand_skill, cand_memory) on val_tasks (the
+            # baseline replay, or the trial of the last edit kept), so decide
+            # from that complete replay instead of starting a new one.
+            final_pairs = current_pairs
+        else:
+            evlog.set_phase(backend, "final_val")
+            final_pairs = replay_batch(backend, val_tasks, cand_skill, cand_memory)
         final_hard, final_soft = aggregate_scores(final_pairs)
         final_score = select_gate_score(final_hard, final_soft, gate_metric, gate_mixed_weight)
         base_gate_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)

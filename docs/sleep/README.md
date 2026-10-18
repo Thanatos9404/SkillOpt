@@ -349,10 +349,18 @@ Deterministic proof (no API key):
 `max_tokens_per_night` in `~/.skillopt-sleep/config.json` (default `400000`)
 stops a `run` or `dry-run` from starting more model work once tonight's spend
 reaches it. The cycle checks the budget before the consolidation, before its
-skill and memory edit steps, before the held-out test replay, and before each
-per-skill fan-out group. Steps that did not start are listed in a note in
-`report.md`, for example
-`max_tokens_per_night reached (431870 of 400000 tokens); skipped: memory edits`.
+skill and memory edit steps, before its final validation replay, before the
+held-out test replay, and before each per-skill fan-out group. Steps that did
+not start are listed in a note in `report.md`, for example
+`max_tokens_per_night reached (431870 of 400000 tokens); skipped: memory edits, final validation replay`.
+
+When the final validation replay is skipped, the gate decides from the
+validation replay that already scored the same skill and memory: the baseline
+replay when no edit was kept, or the trial replay of the last edit that was
+kept. That replay is complete, so no decision rests on partial evidence, and
+it is not repeated. This matters for replays the response cache does not
+serve, such as tool replay or a call that failed or timed out, which would
+otherwise start the model again.
 
 ```json
 {"max_tokens_per_night": 200000}
@@ -366,8 +374,8 @@ This is not a hard cap. A step that has started always finishes, so a night
 can end above the budget by the cost of one step: the first replay of the
 validation and training tasks, one edit step (a training replay, a reflect
 call and a validation replay of the candidate; with `dream_rollouts` set to K,
-K attempts per training task), or the held-out test replay. Each fan-out group
-that starts runs its own first replay.
+K attempts per training task), the final validation replay, or the held-out
+test replay. Each fan-out group that starts runs its own first replay.
 
 Spend comes from the backend's token counter, the one the report header prints
 as `tokens used`. The header shows the backend's running total and the note

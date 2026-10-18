@@ -8,12 +8,13 @@ from __future__ import annotations
 import glob
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from unittest import mock
 
-from skillopt_sleep.backend import MockBackend
+from skillopt_sleep.backend import ClaudeCliBackend, MockBackend
 from skillopt_sleep.config import load_config
 from skillopt_sleep.consolidate import consolidate
 from skillopt_sleep.cycle import run_sleep_cycle
@@ -112,6 +113,68 @@ def _arithmetic_tasks():
     return assign_splits(tasks, holdout_fraction=0.34, seed=42)
 
 
+def _tool_tasks():
+    """Tasks whose rule judge needs a real tool call (the tool replay route)."""
+    tasks = [
+        TaskRecord(
+            id=f"look{i}", project="/p",
+            intent=f"Find note {i} and summarize it.",
+            reference_kind="rule",
+            judge={"kind": "rule", "checks": [{"op": "tool_called", "arg": "search"}]},
+        )
+        for i in range(1, 7)
+    ]
+    return assign_splits(tasks, val_fraction=0.34, seed=42)
+
+
+_REAL_RUN = subprocess.run
+_SEARCH_RULE = "Always run ./search before answering."
+
+
+class SyntheticClaudeProcess:
+    """Stands in for the external ``claude`` process; no model is called.
+
+    Records every process the backend spawns as ``(phase, route)``, where the
+    route is ``tools`` for ``attempt_with_tools`` and ``text`` for ``_call``.
+    Replies with a fixed answer, or raises ``TimeoutExpired`` like a process
+    that ran past the backend's timeout. A reflect call (text route during the
+    train phase) proposes ``_SEARCH_RULE``; a tool replay whose prompt carries
+    that rule logs a call to the ``search`` shim, so its rule judge passes.
+    """
+
+    def __init__(self, backend: ClaudeCliBackend, *, timeout: bool = False) -> None:
+        self.backend = backend
+        self.timeout = timeout
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, cmd, **kwargs):
+        if not cmd or cmd[0] != self.backend.claude_path:
+            return _REAL_RUN(cmd, **kwargs)
+        route = "tools" if "--allowedTools" in cmd else "text"
+        phase = getattr(self.backend, "evidence_phase", "")
+        self.calls.append((phase, route))
+        if self.timeout:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        prompt = kwargs.get("input") or ""
+        if route == "text" and phase == "train":
+            reply = json.dumps([{"op": "add", "content": _SEARCH_RULE}])
+        else:
+            reply = "Here is the summary."
+        if route == "tools" and _SEARCH_RULE in prompt:
+            with open(os.path.join(kwargs["cwd"], "_tool_calls.log"), "a") as log:
+                log.write("search\n")
+        return subprocess.CompletedProcess(cmd, 0, stdout=reply, stderr="")
+
+    def phases(self) -> list[str]:
+        return [phase for phase, _route in self.calls]
+
+
+def _synthetic_claude(timeout: bool = False):
+    backend = ClaudeCliBackend(claude_path="synthetic-claude-for-tests")
+    process = SyntheticClaudeProcess(backend, timeout=timeout)
+    return backend, process
+
+
 class TokenBudgetCycleTest(unittest.TestCase):
     def setUp(self) -> None:
         self._proj = tempfile.TemporaryDirectory()
@@ -176,7 +239,10 @@ class TokenBudgetCycleTest(unittest.TestCase):
         events = read_events(os.path.join(outcome.staging_dir, "evidence.jsonl"))
         end = [e for e in events if (e["stage"], e["event"]) == ("cycle", "end")]
         self.assertEqual(end[-1]["max_tokens_per_night"], limit)
-        self.assertEqual(end[-1]["budget_skipped"], ["skill edits", "memory edits"])
+        self.assertEqual(
+            end[-1]["budget_skipped"],
+            ["skill edits", "memory edits", "final validation replay"],
+        )
 
     def test_one_token_of_headroom_lets_the_next_step_run(self):
         tasks = _tasks()
@@ -461,6 +527,133 @@ class TokenBudgetGroupsTest(unittest.TestCase):
         self.assertIn("token budget", second.reason)
         self.assertEqual(second.n_tasks, len(tasks))
         self.assertIsNone(second.result)
+
+
+class TokenBudgetProviderCallTest(unittest.TestCase):
+    """Count the provider processes a budget-stopped night really starts.
+
+    These drive ``ClaudeCliBackend`` through its own replay routes, with
+    ``subprocess.run`` answered by ``SyntheticClaudeProcess``. Replies the
+    response cache does not serve (tool replay, a timed out call) are visible
+    as new processes, which a caching mock cannot show.
+    """
+
+    def setUp(self) -> None:
+        self._proj = tempfile.TemporaryDirectory()
+        self._home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._proj.cleanup)
+        self.addCleanup(self._home.cleanup)
+        patcher = mock.patch.dict(os.environ, {"SKILLOPT_SLEEP_WORKERS": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _night(self, tasks, *, timeout: bool):
+        cfg = load_config(
+            invoked_project=self._proj.name,
+            projects="invoked",
+            backend="claude",
+            claude_home=os.path.join(self._home.name, ".claude"),
+            state_dir=os.path.join(self._home.name, "state"),
+            auto_adopt=False,
+        )
+        # Any first call spends this, so only the initial replay may run.
+        cfg.data["max_tokens_per_night"] = 1
+        backend, process = _synthetic_claude(timeout)
+        with mock.patch("skillopt_sleep.backend.subprocess.run", side_effect=process):
+            outcome = run_sleep_cycle(cfg, seed_tasks=tasks, backend=backend)
+        return process, outcome
+
+    def _assert_only_the_initial_replay_ran(self, tasks, process, outcome) -> None:
+        n_val = sum(1 for t in tasks if t.split == "val")
+        n_train = sum(1 for t in tasks if t.split == "train")
+        self.assertGreater(n_val, 0)
+        phases = process.phases()
+        self.assertEqual(phases.count("final_val"), 0)
+        self.assertEqual(
+            phases, ["baseline_val"] * n_val + ["train"] * n_train
+        )
+        report = outcome.report
+        self.assertFalse(report.accepted)
+        notes = _budget_notes(report)
+        self.assertEqual(len(notes), 1)
+        self.assertIn(
+            "skipped: skill edits, memory edits, final validation replay", notes[0]
+        )
+        events = read_events(os.path.join(outcome.staging_dir, "evidence.jsonl"))
+        self.assertFalse([
+            e for e in events
+            if (e["stage"], e["event"]) == ("replay", "result")
+            and e.get("phase") == "final_val"
+        ])
+        skips = [e["step"] for e in events if (e["stage"], e["event"]) == ("budget", "skip")]
+        self.assertIn("final validation replay", skips)
+        decision = [e for e in events if (e["stage"], e["event"]) == ("gate", "decision")]
+        self.assertEqual(len(decision), 1)
+        self.assertEqual(
+            decision[0]["candidate_score"], decision[0]["baseline_score"]
+        )
+
+    def test_tool_route_answers_make_no_final_validation_call(self):
+        tasks = _tool_tasks()
+        process, outcome = self._night(tasks, timeout=False)
+        self.assertEqual({route for _phase, route in process.calls}, {"tools"})
+        self._assert_only_the_initial_replay_ran(tasks, process, outcome)
+
+    def test_tool_route_timeouts_make_no_final_validation_call(self):
+        tasks = _tool_tasks()
+        process, outcome = self._night(tasks, timeout=True)
+        self.assertEqual({route for _phase, route in process.calls}, {"tools"})
+        self._assert_only_the_initial_replay_ran(tasks, process, outcome)
+
+    def test_text_route_timeouts_make_no_final_validation_call(self):
+        # An empty reply from a failed call is not kept in the response cache,
+        # so re-scoring the same documents would start the process again.
+        tasks = _arithmetic_tasks()
+        process, outcome = self._night(tasks, timeout=True)
+        self.assertEqual({route for _phase, route in process.calls}, {"text"})
+        self._assert_only_the_initial_replay_ran(tasks, process, outcome)
+
+    def test_text_route_answers_stay_free_cache_hits(self):
+        # Control: here the final replay would have been served from cache.
+        tasks = _arithmetic_tasks()
+        process, outcome = self._night(tasks, timeout=False)
+        self._assert_only_the_initial_replay_ran(tasks, process, outcome)
+
+
+class TokenBudgetFinalScoringTest(unittest.TestCase):
+    """With the budget spent, final scoring reuses the replay of the kept edit."""
+
+    def test_kept_skill_edit_is_scored_from_its_own_validation_replay(self):
+        tasks = _tool_tasks()
+        n_val = sum(1 for t in tasks if t.split == "val")
+        n_train = sum(1 for t in tasks if t.split == "train")
+        backend, process = _synthetic_claude()
+
+        def spent() -> bool:
+            # The budget runs out once the skill step's reflect call started.
+            return ("train", "text") in process.calls
+
+        with mock.patch.dict(os.environ, {"SKILLOPT_SLEEP_WORKERS": "1"}), \
+                mock.patch("skillopt_sleep.backend.subprocess.run", side_effect=process):
+            result = consolidate(
+                backend, tasks, "# skill\n", "", budget_exhausted=spent
+            )
+
+        self.assertEqual(
+            process.calls,
+            [("baseline_val", "tools")] * n_val
+            + [("train", "tools")] * n_train
+            + [("train", "text")]
+            + [("gate_trial:skill", "tools")] * n_val,
+        )
+        self.assertEqual(result.budget_skipped, ["memory edits", "final validation replay"])
+        self.assertTrue(result.accepted)
+        self.assertIn(_SEARCH_RULE, result.new_skill)
+        self.assertEqual(result.candidate_score, 1.0)
+        trial, final = result.gate_trials
+        self.assertEqual(trial["target"], "skill")
+        self.assertEqual(final["target"], "final")
+        self.assertEqual(final["candidate_score"], trial["candidate_score"])
 
 
 if __name__ == "__main__":
